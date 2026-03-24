@@ -1,0 +1,818 @@
+"""
+Pansharpening Network 
+Author: Shen Xu
+Description: 基于小波变换的全色锐化网络，融合多光谱和全色图像特征
+Dependencies: 
+    - torch >= 1.8.0
+    - pytorch_wavelets >= 1.3.0
+
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pytorch_wavelets import DWTForward, DWTInverse
+
+
+# --------------------------- 基础模块定义 ---------------------------
+class ResBlock(nn.Module):
+    """基础残差块"""
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = F.relu(self.bn1(out))
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += residual
+        out = F.relu(out)
+        return out
+
+
+class ResBackbone(nn.Module):
+    """残差骨干网络"""
+    def __init__(self, in_channels):
+        super().__init__()
+        channel = 64
+        self.conv1 = nn.Conv2d(
+            in_channels=in_channels, 
+            out_channels=channel, 
+            kernel_size=3, 
+            padding=1, 
+            stride=1,
+            bias=True
+        )
+
+        self.res_blocks = nn.Sequential(
+            ResBlock(channel),
+            ResBlock(channel),
+            ResBlock(channel),
+            ResBlock(channel),
+        )
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(
+            in_channels=channel, 
+            out_channels=1, 
+            stride=1, 
+            kernel_size=3, 
+            padding=1,
+            bias=True
+        )
+
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.res_blocks(x)
+        x = self.conv2(x)
+        return x
+
+
+class ResBlockSingle(nn.Module):
+    """单通道残差块"""
+    def __init__(self):
+        super().__init__()
+        channel = 64
+        self.conv20 = nn.Conv2d(
+            in_channels=channel, 
+            out_channels=channel, 
+            padding=1, 
+            kernel_size=3, 
+            stride=1,
+            bias=True
+        )
+        self.conv21 = nn.Conv2d(
+            in_channels=channel, 
+            out_channels=channel, 
+            padding=1, 
+            kernel_size=3, 
+            stride=1,
+            bias=True
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        rs1 = self.relu(self.conv20(x))
+        rs2 = self.conv21(rs1)
+        rs = torch.add(x, rs2)
+        return rs
+
+
+class ResBlockCustom(nn.Module):
+    """自定义通道残差块"""
+    def __init__(self, inchannel):
+        super().__init__()
+        self.conv20 = nn.Conv2d(
+            in_channels=inchannel, 
+            out_channels=1, 
+            padding=1, 
+            kernel_size=3, 
+            stride=1,
+            bias=True
+        )
+        self.conv21 = nn.Conv2d(
+            in_channels=1, 
+            out_channels=inchannel, 
+            padding=1, 
+            kernel_size=3, 
+            stride=1,
+            bias=True
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        rs1 = self.relu(self.conv20(x))
+        rs2 = self.conv21(rs1)
+        rs = torch.add(x, rs2)
+        return rs
+
+
+def conv3x3(in_planes, out_planes, stride=1, groups=1):
+    """3x3卷积（带padding）"""
+    return nn.Conv2d(
+        in_planes, 
+        out_planes, 
+        kernel_size=3, 
+        stride=stride,
+        padding=1, 
+        groups=groups
+    )
+
+
+class CB(nn.Module):
+    """卷积块（带批量归一化和LeakyReLU）"""
+    def __init__(self, inplanes, planes, stride=1, groups=1, norm_layer=None):
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1:
+            raise ValueError('BasicBlock only supports groups=1')
+
+        self.conv1 = conv3x3(inplanes, planes)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.LeakyReLU(0.2)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.stride = stride
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        return out
+
+
+# --------------------------- 工具函数 ---------------------------
+def generate_lrp(pan):
+    """
+    生成低分辨率全色图像（LRPAN）
+    Args:
+        pan (torch.Tensor): 输入PAN图像，形状 [B, C, H, W]
+    Returns:
+        lrp (torch.Tensor): 上采样4倍再下采样后的LRPAN图像
+    """
+    # 上采样4倍
+    pan_upsampled = F.interpolate(
+        pan, 
+        scale_factor=4, 
+        mode='bilinear', 
+        align_corners=True
+    )
+    # 下采样到原始分辨率
+    lrp = F.interpolate(
+        pan_upsampled, 
+        size=pan.shape[2:], 
+        mode='bilinear', 
+        align_corners=True
+    )
+    return lrp
+
+
+# --------------------------- 核心模块 ---------------------------
+class DynamicConvModule(nn.Module):
+    """动态卷积核生成模块"""
+    def __init__(self, in_channels, out_channels, kernel_size=5):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(64, 1, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(1, 1, kernel_size=5, stride=1)
+        self.pool = nn.AdaptiveAvgPool2d((5, 5))
+
+    def forward(self, lrpan, lms):
+        # 拼接输入
+        x = torch.cat((lrpan, lms), dim=1)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        dynamic_kernel = self.conv3(x)
+        dynamic_kernel = self.pool(dynamic_kernel)
+        
+        # 调整卷积核形状
+        batch_size = x.shape[0]
+        dynamic_kernel = dynamic_kernel.view(
+            batch_size, 1, 1, self.kernel_size, self.kernel_size
+        )
+        return dynamic_kernel
+
+
+class ImageGenerationModule(nn.Module):
+    """图像生成模块（基于动态卷积）"""
+    def __init__(self, dynamic_conv_module):
+        super().__init__()
+        self.dynamic_conv_module = dynamic_conv_module
+
+    def forward(self, lrpan_hl, lms_hl, pan_hl):
+        # 生成动态卷积核
+        dynamic_kernel_hl = self.dynamic_conv_module(lrpan_hl, lms_hl)
+        
+        # 调整卷积核形状
+        batch_size, _, height, width = pan_hl.shape
+        dynamic_kernel_hl = dynamic_kernel_hl.view(batch_size, 1, 5, 5)
+        
+        # 动态卷积计算
+        pan_unfold = F.unfold(pan_hl, kernel_size=5, padding=2)
+        hrms_hl = (pan_unfold.transpose(1, 2) @ dynamic_kernel_hl.view(batch_size, -1, 1)).transpose(1, 2)
+        hrms_hl = F.fold(hrms_hl, (height, width), kernel_size=1)
+        
+        return hrms_hl
+
+
+class DFM(nn.Module):
+    """特征融合模块（DFM）"""
+    def __init__(self, in_channels, reduction=4):
+        super().__init__()
+        # 防止通道数过小
+        reduced_channels = max(1, in_channels // reduction)
+        
+        # 卷积层定义
+        self.conv1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv3 = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1)
+        self.relu3 = nn.ReLU(inplace=True)
+        self.conv4 = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        residual = x
+        x = self.relu1(self.conv1(x))
+        x = self.relu2(self.conv2(x))
+        cheng = x
+        
+        # 通道注意力机制
+        gap = self.relu3(self.conv3(x))
+        gap = self.sigmoid(self.conv4(gap))
+        
+        # 特征融合
+        out = cheng * gap + residual
+        return out
+
+
+class FeatureUnit(nn.Module):
+    """特征融合单元（FeatureUnit）"""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 1, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(1, 1, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv2d(1, 1, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv2d(1, 1, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv2d(1, 1, kernel_size=3, padding=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, dra, x):
+        temp = self.conv1(self.conv2(dra))
+        cheng = self.sigmoid(self.conv3(self.conv4(temp)))
+        temp = temp * cheng
+        return self.conv5(temp)
+
+
+class MixResBlock(nn.Module):
+    """混合残差块"""
+    def __init__(self, in_size, out_size, relu_slope=0.2, use_HIN=False):
+        super().__init__()
+        self.identity = nn.Conv2d(4, out_size, 1, 1, 0)
+        self.conv_1 = nn.Conv2d(in_size, out_size, kernel_size=3, padding=1, bias=True)
+        self.relu_1 = nn.LeakyReLU(relu_slope, inplace=False)
+        self.conv_2 = nn.Conv2d(out_size, out_size, kernel_size=3, padding=1, bias=True)
+        self.relu_2 = nn.LeakyReLU(relu_slope, inplace=False)
+        self.conv_3 = nn.Conv2d(in_size+in_size, out_size, 3, 1, 1)
+        
+        if use_HIN:
+            self.norm = nn.InstanceNorm2d(out_size // 2, affine=True)
+        self.use_HIN = use_HIN
+
+    def forward(self, x):
+        resi = self.conv_1(x)
+        out_1, out_2 = torch.chunk(resi, 2, dim=1)
+        resi = torch.cat([out_1, out_2], dim=1)
+        resi = self.conv_2(resi)
+        return self.identity(resi) + x
+
+
+class NonLocalBlock(nn.Module):
+    """非局部注意力模块"""
+    def __init__(self, channel):
+        super().__init__()
+        self.inter_channel = channel // 2
+        self.conv_phi = nn.Conv2d(
+            in_channels=channel, 
+            out_channels=self.inter_channel, 
+            kernel_size=1, 
+            stride=1,
+            padding=0, 
+            bias=False
+        )
+        self.conv_theta = nn.Conv2d(
+            in_channels=channel, 
+            out_channels=self.inter_channel, 
+            kernel_size=1, 
+            stride=1, 
+            padding=0, 
+            bias=False
+        )
+        self.conv_g = nn.Conv2d(
+            in_channels=channel, 
+            out_channels=self.inter_channel, 
+            kernel_size=1, 
+            stride=1, 
+            padding=0, 
+            bias=False
+        )
+        self.softmax = nn.Softmax(dim=1)
+        self.conv_mask = nn.Conv2d(
+            in_channels=self.inter_channel, 
+            out_channels=channel, 
+            kernel_size=1, 
+            stride=1, 
+            padding=0, 
+            bias=False
+        )
+        self.LeakyReLU = nn.LeakyReLU(0.1, inplace=False)
+        self.conv_transfer = nn.Conv2d(
+            in_channels=channel, 
+            out_channels=channel, 
+            kernel_size=1, 
+            stride=1, 
+            padding=0, 
+            bias=False
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        
+        # 特征变换
+        x_phi = self.conv_phi(x).view(b, self.inter_channel, -1)
+        x_theta = self.conv_theta(x).view(b, self.inter_channel, -1)
+        x_g = self.conv_g(x).view(b, self.inter_channel, -1)
+        
+        # 计算注意力权重
+        mul_theta_phi = torch.mul(x_theta, x_phi)
+        mul_theta_phi = self.softmax(mul_theta_phi)
+        
+        # 注意力加权
+        mul_theta_phi_g = torch.mul(mul_theta_phi, x_g)
+        mul_theta_phi_g = mul_theta_phi_g.permute(0,2,1).contiguous().view(b, self.inter_channel, h, w)
+        mask = self.conv_mask(mul_theta_phi_g)
+        
+        # 全局特征融合
+        global1 = self.LeakyReLU(mask)
+        global2 = self.conv_transfer(global1)
+        global3 = self.LeakyReLU(global2)
+        out = global3 + x
+        
+        return out
+
+
+class MultiFusion(nn.Module):
+    """多尺度融合模块"""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels=2, out_channels=2, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv3 = nn.Conv2d(in_channels=2, out_channels=2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.softmax = nn.Softmax()
+        self.relu1 = nn.ReLU()
+        self.relu3 = nn.ReLU()
+        self.just = nn.Conv2d(in_channels=4, out_channels=2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.just1 = nn.Conv2d(in_channels=2, out_channels=4, kernel_size=3, stride=1, padding=1, bias=False)
+
+    def forward(self, x):
+        x1 = self.relu1(self.conv1(x))
+        x3 = self.relu3(self.conv3(x))
+        cont = torch.cat([x1, x3], 1)
+        cont = self.softmax(cont)
+        re = cont + self.just1(x)
+        return re
+
+
+class MultiFusion1(nn.Module):
+    """自定义通道多尺度融合模块"""
+    def __init__(self, inchannles, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels=inchannles, 
+            out_channels=channels//2, 
+            kernel_size=1, 
+            stride=1,
+            padding=0, 
+            bias=False
+        )
+        self.conv3 = nn.Conv2d(
+            in_channels=inchannles, 
+            out_channels=channels//2, 
+            kernel_size=3, 
+            stride=1, 
+            padding=1, 
+            bias=False
+        )
+        self.softmax = nn.Softmax()
+        self.relu1 = nn.ReLU()
+        self.relu3 = nn.ReLU()
+        self.just1 = nn.Conv2d(
+            in_channels=inchannles, 
+            out_channels=channels, 
+            kernel_size=3, 
+            stride=1, 
+            padding=1, 
+            bias=False
+        )
+
+    def forward(self, x):
+        x1 = self.relu1(self.conv1(x))
+        x3 = self.relu3(self.conv3(x))
+        cont = torch.cat([x1, x3], 1)
+        cont = self.softmax(cont)
+        re = cont + self.just1(x)
+        return re
+
+
+# --------------------------- 主网络 ---------------------------
+class PansharpeningNet(nn.Module):
+    """基于IDWT的全色锐化主网络"""
+    def __init__(self, channels, num_domains=2, embedding_dim=16):
+        super().__init__()
+        # 小波变换模块
+        self.dwt_pan = DWTForward(J=1, wave='db4')
+        self.dwt_diff = DWTForward(J=1, wave='db4')
+        self.dwt_lms = DWTForward(J=1, wave='db4')
+        self.dwt_lrms = DWTForward(J=1, wave='db4')
+        self.dwt_lrpan = DWTForward(J=1, wave='db4')
+        self.dwt_ = DWTForward(J=1, wave='db4')
+        self.idwt = DWTInverse(wave='db4')
+
+        # 动态卷积核列表
+        self.dynamic_kernels = nn.ModuleList([
+            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1)
+            for _ in range(channels)
+        ])
+
+        # 通道调整卷积
+        self.adjust_conv = nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, padding=1)
+
+        # 残差模块
+        self.resblock = ResBlockSingle()
+        self.resblock_mspan = ResBlockCustom(1)
+        self.resblock_additional = nn.ModuleList([
+            ResBlockCustom(channels) for _ in range(3)
+        ])
+
+        # 基础卷积层
+        self.conv1 = nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=channels * 2 + 1, out_channels=channels, kernel_size=3, padding=1)
+
+        # 可学习参数
+        self.a = nn.Parameter(torch.tensor(0.1))
+        self.b = nn.Parameter(torch.tensor(0.6))
+
+        # 特征提取器
+        self.feature_extractor_pan = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1),
+            nn.LeakyReLU(),
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, padding=1)
+        )
+
+        # 动态卷积模块
+        self.dynamic_conv_module = DynamicConvModule(in_channels=2, out_channels=1, kernel_size=5)
+        self.dynamic_conv_module1 = DynamicConvModule(in_channels=2, out_channels=1, kernel_size=5)
+        self.dynamic_conv_module2 = DynamicConvModule(in_channels=2, out_channels=1, kernel_size=5)
+        
+        # 图像生成模块
+        self.image_gen_module = ImageGenerationModule(self.dynamic_conv_module)
+        self.image_gen_module1 = ImageGenerationModule(self.dynamic_conv_module1)
+        self.image_gen_module2 = ImageGenerationModule(self.dynamic_conv_module2)
+
+        # 激活函数
+        self.relu = nn.ReLU()
+        self.prelu = nn.PReLU()
+        self.lrelu = nn.LeakyReLU()
+
+        # 卷积块
+        self.cb = CB(3, 3)
+        self.convhl = nn.Conv2d(in_channels=6, out_channels=3, kernel_size=3, padding=1)
+
+        # 采样层
+        self.downsample = nn.Upsample(scale_factor=0.5, mode='bilinear', align_corners=True)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+
+        # 残差骨干
+        self.res_blocks = nn.Sequential(
+            ResBlockSingle(),
+            ResBlockSingle(),
+            ResBlockSingle(),
+            ResBlockSingle(),
+        )
+
+        # 卷积层
+        self.conv1t1 = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding=1, bias=True)
+        self.conv64t48 = nn.Conv2d(in_channels=64, out_channels=channels, kernel_size=3, stride=1, padding=1, bias=True)
+        self.conv2t1 = nn.Conv2d(in_channels=2, out_channels=1, kernel_size=3, stride=1, padding=1, bias=True)
+        
+        # 多尺度卷积
+        self.conv9t3 = nn.ModuleList([
+            nn.Conv2d(in_channels=3, out_channels=3, kernel_size=3, stride=1, padding=1, bias=True) 
+            for _ in range(channels)
+        ])
+        self.conv9t31 = nn.Conv2d(in_channels=9, out_channels=3, kernel_size=3, stride=1, padding=1, bias=True)
+
+        # 通道调整卷积列表
+        self.adjust_convs = nn.ModuleList([
+            nn.Conv2d(in_channels=32, out_channels=1, kernel_size=3, padding=1)
+            for _ in range(channels)
+        ])
+
+        # 特征提取器列表
+        self.feature_extractors_diff = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, padding=1),
+                ResBlockCustom(inchannel=32),
+                ResBlockCustom(inchannel=32),
+                nn.Conv2d(in_channels=32, out_channels=4, kernel_size=3, padding=1)
+            ) for _ in range(channels)
+        ])
+
+        self.feature_extractors_yh = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels=6, out_channels=32, kernel_size=3, padding=1),
+                NonLocalBlock(32),
+                nn.Conv2d(in_channels=32, out_channels=3, kernel_size=3, padding=1),
+            ) for _ in range(channels)
+        ])
+
+        self.feature_extractors_yh_x = nn.Sequential(
+            nn.Conv2d(in_channels=channels+3, out_channels=32, kernel_size=3, padding=1),
+            NonLocalBlock(32),
+            nn.Conv2d(in_channels=32, out_channels=channels, kernel_size=3, padding=1),
+        )
+
+        self.feature_extractors_yh_y = nn.Sequential(
+            nn.Conv2d(in_channels=channels+3, out_channels=32, kernel_size=3, padding=1),
+            NonLocalBlock(32),
+            nn.Conv2d(in_channels=32, out_channels=channels, kernel_size=3, padding=1),
+        )
+
+        self.feature_extractors_yh_z = nn.Sequential(
+            nn.Conv2d(in_channels=channels+3, out_channels=64, kernel_size=3, padding=1),
+            ResBlockSingle(),
+            nn.Conv2d(in_channels=64, out_channels=channels, kernel_size=3, padding=1),
+        )
+
+        # 域嵌入
+        self.domain_embedding = nn.Embedding(num_embeddings=num_domains, embedding_dim=embedding_dim)
+        self.embedding_dim = embedding_dim
+        self.in_channels = 2 + channels
+        self.cov2t64 = nn.Conv2d(
+            in_channels=self.in_channels, 
+            out_channels=64, 
+            kernel_size=3, 
+            stride=1, 
+            padding=1,
+            bias=True
+        )
+
+        # 特征融合模块
+        self.dfm = DFM(channels*2)
+        self.conv8t4 = nn.Conv2d(
+            in_channels=channels*2, 
+            out_channels=channels, 
+            kernel_size=3, 
+            stride=1, 
+            padding=1,
+            bias=True
+        )
+
+        # Sobel算子卷积层（边缘检测）
+        sobel_kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                                     dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        sobel_kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                                     dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        sobel_kernel_diag = torch.tensor([[-1, 0, 1], [0, 0, 0], [1, 0, -1]], 
+                                        dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+        self.conv_x = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        self.conv_y = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        self.conv_diag = nn.Conv2d(1, 1, 3, padding=1, bias=False)
+        
+        # 初始化Sobel权重
+        self.conv_x.weight.data = sobel_kernel_x.repeat(1, 3, 1, 1)
+        self.conv_y.weight.data = sobel_kernel_y.repeat(1, 3, 1, 1)
+        self.conv_diag.weight.data = sobel_kernel_diag.repeat(1, 3, 1, 1)
+        
+        # 设置权重可学习
+        self.conv_x.weight.requires_grad = True
+        self.conv_y.weight.requires_grad = True
+        self.conv_diag.weight.requires_grad = True
+
+        # 注意力模块
+        self.attention = nn.ModuleList([FeatureUnit() for _ in range(channels)])
+        self.attention1 = nn.ModuleList([FeatureUnit() for _ in range(channels)])
+        self.attention2 = nn.ModuleList([FeatureUnit() for _ in range(channels)])
+
+        # 混合残差块
+        self.P1 = MixResBlock(1, channels)
+
+        # 非局部模块
+        self.nolocal = nn.ModuleList([NonLocalBlock(4+1) for _ in range(channels)])
+        self.nolocal1 = NonLocalBlock(channels*2)
+
+        # 卷积层列表
+        self.conv8t41 = nn.ModuleList([
+            nn.Conv2d(5, 1, kernel_size=3, stride=1, padding=1, bias=True) 
+            for _ in range(channels)
+        ])
+        self.conv8t411 = nn.Conv2d(
+            channels*2, 
+            channels, 
+            kernel_size=3, 
+            stride=1, 
+            padding=1, 
+            bias=True
+        )
+
+        # 多尺度融合模块列表
+        self.multi = nn.ModuleList([MultiFusion() for _ in range(channels)])
+        self.multi1 = MultiFusion1(channels+1, channels)
+
+        # 扩展特征提取器
+        self.exx = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels=2, out_channels=64, kernel_size=3, padding=1),
+                ResBlockSingle(),
+                ResBlockSingle(),
+                nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1)
+            ) for _ in range(channels)
+        ])
+
+        self.exy = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels=2, out_channels=64, kernel_size=3, padding=1),
+                ResBlockSingle(),
+                ResBlockSingle(),
+                nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1)
+            ) for _ in range(channels)
+        ])
+
+        self.exz = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels=2, out_channels=64, kernel_size=3, padding=1),
+                ResBlockSingle(),
+                ResBlockSingle(),
+                nn.Conv2d(in_channels=64, out_channels=1, kernel_size=3, padding=1)
+            ) for _ in range(channels)
+        ])
+
+        # 最终卷积层
+        self.convhrmsms = nn.Conv2d(channels*2, channels, 3, padding=1, bias=False)
+
+    def forward(self, ms, pan, lms, gt, domain_label):
+        """
+        前向传播
+        Args:
+            ms: 多光谱图像 [B, C, H, W]
+            pan: 全色图像 [B, 1, H, W]
+            lms: 低分辨率多光谱图像 [B, C, H, W]
+            gt: 真实标签 [B, C, H, W]
+            domain_label: 域标签 [B]
+        Returns:
+            hrms: 高分辨率多光谱图像 [B, C, H, W]
+        """
+        # PAN图像上下采样增强
+        pan_down_up = self.upsample(self.downsample(pan))
+        pan_updown = self.prelu(self.conv1t1(pan_down_up))
+
+        # 输入特征拼接
+        input_feat = torch.cat([ms, pan, pan_updown], dim=1)
+        y = self.cov2t64(input_feat)
+        y = self.res_blocks(y)
+        y1 = self.conv64t48(y)
+        rs = y1 + ms
+
+        # 生成LRPAN
+        lrp = generate_lrp(pan)
+
+        # PAN图像小波分解
+        pan_pro = self.feature_extractor_pan(pan)
+        pan_coeffs = self.dwt_pan(pan_pro)
+        pan_LL, pan_yh = pan_coeffs
+
+        # LRPAN小波分解
+        lrpan_coeffs = self.dwt_lrpan(lrp)
+        lrpan_LL, lrpan_yh = lrpan_coeffs
+
+        # 原始PAN小波分解
+        rpan_coeffs = self.dwt_pan(pan)
+        rpan_LL, rpan_yh = rpan_coeffs
+
+        # 逐波段处理
+        fused_bands = []
+        for i in range(rs.shape[1]):
+            # 提取单个波段
+            ms_band = rs[:, i:i + 1, :, :]
+            
+            # 小波分解
+            lms_coeff = self.dwt_lms(ms_band)
+            lms_LL, lms_yh = lms_coeff
+            
+            lrms_coeff = self.dwt_lrms(ms[:, i:i + 1, :, :])
+            lrms_LL, lrms_yh = lrms_coeff
+
+            # 低频分量融合
+            p1 = lms_LL - self.multi[i](torch.cat([lms_LL, pan_LL], 1))
+            fused_LL = p1 - lrms_LL
+            fused_LL = self.nolocal[i](torch.cat([fused_LL, lrms_LL], 1))
+            fused_LL = self.conv8t41[i](fused_LL)
+
+            # 高频分量处理
+            pan_yh_resize = pan_yh[0].squeeze(1)
+            lms_yh_resize = lms_yh[0].squeeze(1)
+            lrms_yh_resize = lrms_yh[0].squeeze(1)
+            rpan_yh_resize = rpan_yh[0].squeeze(1)
+
+            # 特征提取
+            ms_pan_yh = self.feature_extractors_yh[i](
+                torch.cat((pan_yh_resize, lms_yh_resize), dim=1)
+            )
+
+            # Sobel边缘检测
+            x = self.conv_x(rpan_yh_resize)
+            y = self.conv_y(rpan_yh_resize)
+            d = self.conv_diag(rpan_yh_resize)
+
+            # 注意力增强
+            x = self.attention[i](x, lrms_yh_resize)
+            y = self.attention1[i](y, lrms_yh_resize)
+            z = self.attention2[i](d, lrms_yh_resize)
+
+            # 多尺度卷积
+            ms_pan_yh1 = self.conv9t3[i](torch.cat([x, y, z], 1))
+            ms_pan_yh1 = ms_pan_yh1.unsqueeze(1)
+            ms_pan_yh = ms_pan_yh.unsqueeze(1)
+
+            # 高频分量融合
+            yh = ms_pan_yh
+
+            # 小波逆变换
+            fused_coeffs = (fused_LL, [yh])
+            i_hrms = self.idwt(fused_coeffs)
+            fused_bands.append(i_hrms)
+
+        # 拼接所有波段
+        hrms = torch.cat(fused_bands, dim=1)
+        
+        # 特征融合
+        hrms = torch.cat([hrms, ms], dim=1)
+        hrms = self.dfm(hrms)
+        hrms = self.conv8t4(hrms)
+        hrms = hrms + ms
+
+        return hrms
+
+
+# --------------------------- 测试代码 ---------------------------
+if __name__ == "__main__":
+    # 测试网络初始化和前向传播
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    channels = 4  # 多光谱波段数
+    model = PansharpeningNet(channels=channels).to(device)
+    
+    # 生成测试数据
+    batch_size = 1
+    height, width = 128, 128
+    ms = torch.randn(batch_size, channels, height, width).to(device)
+    pan = torch.randn(batch_size, 1, height, width).to(device)
+    lms = torch.randn(batch_size, channels, height, width).to(device)
+    gt = torch.randn(batch_size, channels, height, width).to(device)
+    domain_label = torch.tensor([0]).to(device)
+    
+    # 前向传播
+    output = model(ms, pan, lms, gt, domain_label)
+    print(f"Input MS shape: {ms.shape}")
+    print(f"Output HRMS shape: {output.shape}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
